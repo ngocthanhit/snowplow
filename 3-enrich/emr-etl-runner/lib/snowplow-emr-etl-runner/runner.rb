@@ -14,15 +14,14 @@
 # License::   Apache License Version 2.0
 
 require 'contracts'
+include Contracts
 
 module Snowplow
   module EmrEtlRunner
     class Runner
 
-      include Contracts
-
       # Supported options
-      @@collector_format_regex = /^(?:cloudfront|clj-tomcat|thrift|(?:json\/.+\/.+)|(?:tsv\/.+\/.+))$/
+      @@collector_formats = Set.new(%w(cloudfront clj-tomcat))
       @@skip_options = Set.new(%w(staging s3distcp emr enrich shred archive))
 
       include Logging
@@ -48,7 +47,8 @@ module Snowplow
         # Now our core flow
         unless @args[:skip].include?('staging')
           unless S3Tasks.stage_logs_for_emr(@args, @config)
-            raise NoDataToProcessError, "No Snowplow logs to process since last run"
+            logger.info "No Snowplow logs to process since last run, exiting"
+            exit 0
           end
         end
 
@@ -113,11 +113,9 @@ module Snowplow
           end
         end
 
-        input_collector_format = config[:etl][:collector_format]
-
         # Validate the collector format
-        unless input_collector_format =~ @@collector_format_regex
-          raise ConfigError, "collector_format '%s' not supported" % input_collector_format
+        unless @@collector_formats.include?(config[:etl][:collector_format]) 
+          raise ConfigError, "collector_format '%s' not supported" % config[:etl][:collector_format]
         end
 
         # Currently we only support start/end times for the CloudFront collector format. See #120 for details

@@ -15,19 +15,21 @@
 
 require 'set'
 require 'elasticity'
+
 require 'sluice'
+
 require 'awrence'
 require 'json'
 require 'base64'
+
 require 'contracts'
+include Contracts
 
 # Ruby class to execute Snowplow's Hive jobs against Amazon EMR
 # using Elasticity (https://github.com/rslifka/elasticity).
 module Snowplow
   module EmrEtlRunner
     class EmrJob
-
-      include Contracts
 
       # Constants
       JAVA_PACKAGE = "com.snowplowanalytics.snowplow"
@@ -55,83 +57,74 @@ module Snowplow
           config[:aws][:access_key_id],
           config[:aws][:secret_access_key])
 
+        @existing_jobflow_id = config[:emr][:jobflow_id]
+
         # Create a job flow with your AWS credentials
-        @jobflow = Elasticity::JobFlow.new(config[:aws][:access_key_id], config[:aws][:secret_access_key])
+        if !@existing_jobflow_id.nil?
+          @jobflow = Elasticity::JobFlow.from_jobflow_id(config[:aws][:access_key_id], config[:aws][:secret_access_key], @existing_jobflow_id, config[:emr][:region])
+        else
+          @jobflow = Elasticity::JobFlow.new(config[:aws][:access_key_id], config[:aws][:secret_access_key])
 
-        # Configure
-        @jobflow.name                 = config[:etl][:job_name]
-        @jobflow.ami_version          = config[:emr][:ami_version]
-        @jobflow.ec2_key_name         = config[:emr][:ec2_key_name]
+          # Configure
+          @jobflow.name                 = config[:etl][:job_name]
+          @jobflow.ami_version          = config[:emr][:ami_version]
+          @jobflow.ec2_key_name         = config[:emr][:ec2_key_name]
 
-        @jobflow.instance_variable_set(:@region, config[:emr][:region]) # Workaround until https://github.com/snowplow/snowplow/issues/753
-        @jobflow.placement            = config[:emr][:placement]
-        unless config[:emr][:ec2_subnet_id].nil? # Nils placement so do last and conditionally
-          @jobflow.ec2_subnet_id      = config[:emr][:ec2_subnet_id]
-        end
-
-        @jobflow.log_uri              = config[:s3][:buckets][:log]
-        @jobflow.enable_debugging     = debug
-        @jobflow.visible_to_all_users = true
-
-        @jobflow.instance_count       = config[:emr][:jobflow][:core_instance_count] + 1 # +1 for the master instance
-        @jobflow.master_instance_type = config[:emr][:jobflow][:master_instance_type]
-        @jobflow.slave_instance_type  = config[:emr][:jobflow][:core_instance_type]
-
-        if config[:etl][:collector_format] == 'thrift'
-          [
-            Elasticity::HadoopBootstrapAction.new('-s', 'io.file.buffer.size=65536'),
-            Elasticity::HadoopBootstrapAction.new('-m', 'mapreduce.user.classpath.first=true')
-          ].each do |action|
-            @jobflow.add_bootstrap_action(action)
+          @jobflow.instance_variable_set(:@region, config[:emr][:region]) # Workaround until https://github.com/snowplow/snowplow/issues/753
+          @jobflow.placement            = config[:emr][:placement]
+          unless config[:emr][:ec2_subnet_id].nil? # Nils placement so do last and conditionally
+            @jobflow.ec2_subnet_id      = config[:emr][:ec2_subnet_id]
           end
-        end
 
-        # Add custom bootstrap actions
-        bootstrap_actions = config[:emr][:bootstrap]
-        bootstrap_actions.each do |bootstrap_action|
-          @jobflow.add_bootstrap_action(Elasticity::BootstrapAction.new(bootstrap_action))
-        end
+          @jobflow.log_uri              = config[:s3][:buckets][:log]
+          @jobflow.enable_debugging     = debug
+          @jobflow.visible_to_all_users = true
 
-        # Install and launch HBase
-        hbase = config[:emr][:software][:hbase]
-        unless not hbase
-          install_hbase_action = Elasticity::BootstrapAction.new("s3://#{config[:emr][:region]}.elasticmapreduce/bootstrap-actions/setup-hbase")
-          @jobflow.add_bootstrap_action(install_hbase_action)
+          @jobflow.instance_count       = config[:emr][:jobflow][:core_instance_count] + 1 # +1 for the master instance
+          @jobflow.master_instance_type = config[:emr][:jobflow][:master_instance_type]
+          @jobflow.slave_instance_type  = config[:emr][:jobflow][:core_instance_type]
 
-          start_hbase_step = Elasticity::CustomJarStep.new("/home/hadoop/lib/hbase-#{hbase}.jar")
-          start_hbase_step.name = "Start HBase #{hbase}"
-          start_hbase_step.arguments = [ 'emr.hbase.backup.Main', '--start-master' ]
-          @jobflow.add_step(start_hbase_step)
-        end
+          # Install and launch HBase
+          hbase = config[:emr][:software][:hbase]
+          unless not hbase
+            install_hbase_action = Elasticity::BootstrapAction.new("s3://#{config[:emr][:region]}.elasticmapreduce/bootstrap-actions/setup-hbase")
+            @jobflow.add_bootstrap_action(install_hbase_action)
 
-        # Install Lingual
-        lingual = config[:emr][:software][:lingual]
-        unless not lingual
-          install_lingual_action = Elasticity::BootstrapAction.new("s3://files.concurrentinc.com/lingual/#{lingual}/lingual-client/install-lingual-client.sh")
-          @jobflow.add_bootstrap_action(install_lingual_action)
-        end
+            start_hbase_step = Elasticity::CustomJarStep.new("/home/hadoop/lib/hbase-#{hbase}.jar")
+            start_hbase_step.name = "Start HBase #{hbase}"
+            start_hbase_step.arguments = [ 'emr.hbase.backup.Main', '--start-master' ]
+            @jobflow.add_step(start_hbase_step)
+          end
 
-        # For serialization debugging. TODO doesn't work yet
-        # install_ser_debug_action = Elasticity::BootstrapAction.new("s3://snowplow-hosted-assets/common/emr/cascading-ser-debug.sh")
-        # @jobflow.add_bootstrap_action(install_ser_debug_action)
+          # Install Lingual
+          lingual = config[:emr][:software][:lingual]
+          unless not lingual
+            install_lingual_action = Elasticity::BootstrapAction.new("s3://files.concurrentinc.com/lingual/#{lingual}/lingual-client/install-lingual-client.sh")
+            @jobflow.add_bootstrap_action(install_lingual_action)
+          end
 
-        # Now let's add our task group if required
-        tic = config[:emr][:jobflow][:task_instance_count]
-        if tic > 0
-          instance_group = Elasticity::InstanceGroup.new.tap { |ig|
-            ig.count = tic
-            ig.type  = config[:emr][:jobflow][:task_instance_type]
-            
-            tib = config[:emr][:jobflow][:task_instance_bid]
-            if tib.nil?
-              ig.set_on_demand_instances
-            else
-              ig.set_spot_instances(tib)
-            end
-          }
+          # For serialization debugging. TODO doesn't work yet
+          # install_ser_debug_action = Elasticity::BootstrapAction.new("s3://snowplow-hosted-assets/common/emr/cascading-ser-debug.sh")
+          # @jobflow.add_bootstrap_action(install_ser_debug_action)
 
-          @jobflow.set_task_instance_group(instance_group)
-        end
+          # Now let's add our task group if required
+          tic = config[:emr][:jobflow][:task_instance_count]
+          if tic > 0
+            instance_group = Elasticity::InstanceGroup.new.tap { |ig|
+              ig.count = tic
+              ig.type  = config[:emr][:jobflow][:task_instance_type]
+
+              tib = config[:emr][:jobflow][:task_instance_bid]
+              if tib.nil?
+                ig.set_on_demand_instances
+              else
+                ig.set_spot_instances(tib)
+              end
+            }
+
+            @jobflow.set_task_instance_group(instance_group)
+          end
+        end #Thanh added: end of check existing_jobflow_id 
 
         s3_endpoint = self.class.get_s3_endpoint(config[:s3][:region])
         csbr = config[:s3][:buckets][:raw]
@@ -152,15 +145,24 @@ module Snowplow
 
           # 1. Compaction to HDFS (only for CloudFront currently)
           raw_input = csbr[:processing]
-          to_hdfs = (self.class.is_cloudfront_log(config[:etl][:collector_format]) and s3distcp)
-
-          enrich_step_input = if to_hdfs
+          enrich_step_input = if config[:etl][:collector_format] == "cloudfront" and s3distcp
             "hdfs:///local/snowplow/raw-events/"
           else
             raw_input
           end
 
-          if to_hdfs
+          if config[:etl][:collector_format] == "cloudfront" and s3distcp
+            
+            #TODO: Thanh added : clear the raw-events before process: 
+            jar_step = Elasticity::CustomJarStep.new('s3://elasticmapreduce/libs/script-runner/script-runner.jar')
+
+            jar_step.name << ":Clear out previous HDFS data."   
+            # (optional) Arguments passed to the jar
+            jar_step.arguments = ['s3://sg-snowplow-staging-etl/custom_script/clearhdfs.sh']
+            jar_step.action_on_failure = 'CANCEL_AND_WAIT' 
+            
+            @jobflow.add_step(jar_step)
+
             # Create the Hadoop MR step for the file crushing
             compact_to_hdfs_step = Elasticity::S3DistCpStep.new
             compact_to_hdfs_step.arguments = [
@@ -175,6 +177,7 @@ module Snowplow
 
             # Add to our jobflow
             @jobflow.add_step(compact_to_hdfs_step)
+
           end
 
           # 2. Enrichment
@@ -200,7 +203,7 @@ module Snowplow
             }
           )
 
-          # Late check whether our enrichment directory is empty. We do an early check too
+          # Late check whether our target directory is empty
           csbe_good_loc = Sluice::Storage::S3::Location.new(csbe[:good])
           unless Sluice::Storage::S3::is_empty?(s3, csbe_good_loc)
             raise DirectoryNotEmptyError, "Cannot safely add enrichment step to jobflow, #{csbe_good_loc} is not empty"
@@ -288,13 +291,16 @@ module Snowplow
       # Throws a RuntimeError if the jobflow does not succeed.
       Contract None => nil
       def run()
-
-        jobflow_id = @jobflow.run
+        if !@existing_jobflow_id.nil?
+          jobflow_id = @existing_jobflow_id
+        else
+          jobflow_id = @jobflow.run
+        end
         logger.debug "EMR jobflow #{jobflow_id} started, waiting for jobflow to complete..."
         status = wait_for()
 
         if !status
-          raise EmrExecutionError, get_failure_details()
+          raise EmrExecutionError, "EMR jobflow #{jobflow_id} failed, check Amazon EMR console and Hadoop logs for details (help: https://github.com/snowplow/snowplow/wiki/Troubleshooting-jobs-on-Elastic-MapReduce). Data files not archived."
         end
 
         logger.debug "EMR jobflow #{jobflow_id} completed successfully."
@@ -363,99 +369,10 @@ module Snowplow
           rescue SocketError => se
             logger.warn "Got socket error #{se}, waiting 5 minutes before checking jobflow again"
             sleep(300)
-          rescue Errno::ECONNREFUSED => ref
-            logger.warn "Got connection refused #{ref}, waiting 5 minutes before checking jobflow again"
-            sleep(300)
-          rescue Errno::ECONNRESET => res
-            logger.warn "Got connection reset #{res}, waiting 5 minutes before checking jobflow again"
-            sleep(300)
           end
         end
 
         success
-      end
-
-      # Prettified string containing failure details
-      # for this job flow.
-      Contract None => String
-      def get_failure_details()
-
-        js = @jobflow.status
-
-        [
-          "EMR jobflow #{js.jobflow_id} failed, check Amazon EMR console and Hadoop logs for details (help: https://github.com/snowplow/snowplow/wiki/Troubleshooting-jobs-on-Elastic-MapReduce). Data files not archived.",
-          "#{js.name}: #{js.state} [#{js.last_state_change_reason}] ~ #{self.class.get_elapsed_time(js.started_at, js.ended_at)} #{self.class.get_timespan(js.started_at, js.ended_at)}"
-        ].concat(js.steps
-            .sort { |a,b|
-              self.class.nilable_spaceship(a.started_at, b.started_at)
-            }
-            .each_with_index
-            .map { |s,i|
-              " - #{i + 1}. #{s.name}: #{s.state} ~ #{self.class.get_elapsed_time(s.started_at, s.ended_at)} #{self.class.get_timespan(s.started_at, s.ended_at)}"
-            })
-          .join("\n")
-      end
-
-      # Gets the time span.
-      #
-      # Parameters:
-      # +start+:: start time
-      # +_end+:: end time
-      Contract Maybe[Time], Maybe[Time] => String
-      def self.get_timespan(start, _end)
-        "[#{start} - #{_end}]"
-      end
-
-      # Spaceship operator supporting nils
-      #
-      # Parameters:
-      # +a+:: First argument
-      # +b+:: Second argument
-      Contract Maybe[Time], Maybe[Time] => Num
-      def self.nilable_spaceship(a, b)
-        case
-        when (a.nil? and b.nil?)
-          0
-        when a.nil?
-          1
-        when b.nil?
-          -1
-        else
-          a <=> b
-        end
-      end
-
-      # Gets the elapsed time in a
-      # human-readable format.
-      #
-      # Parameters:
-      # +start+:: start time
-      # +_end+:: end time
-      Contract Maybe[Time], Maybe[Time] => String
-      def self.get_elapsed_time(start, _end)
-        if start.nil? or _end.nil?
-          "elapsed time n/a"
-        else
-          # Adapted from http://stackoverflow.com/a/19596579/255627
-          seconds_diff = (start - _end).to_i.abs
-
-          hours = seconds_diff / 3600
-          seconds_diff -= hours * 3600
-
-          minutes = seconds_diff / 60
-          seconds_diff -= minutes * 60
-
-          seconds = seconds_diff
-
-          "#{hours.to_s.rjust(2, '0')}:#{minutes.to_s.rjust(2, '0')}:#{seconds.to_s.rjust(2, '0')}"
-        end
-      end
-
-      # Does this collector format represent CloudFront
-      # access logs?
-      Contract String => Bool
-      def self.is_cloudfront_log(collector_format)
-        (collector_format == "cloudfront" or collector_format.start_with?("tsv/com.amazon.aws.cloudfront/"))
       end
 
       # We need to partition our output buckets by run ID
